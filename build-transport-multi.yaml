@@ -1,0 +1,387 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    exclude:
+     - pipelines
+
+pool:
+  vmImage: windows-latest
+
+name: $(BuildNumber)$(Rev:.r)
+
+steps:
+- checkout: self
+  persistCredentials: true
+
+- task: NuGetCommand@2
+  inputs:
+    command: 'restore'
+    restoreSolution: '$(Build.SourcesDirectory)/Coop/Coop.sln'
+    feedsToUse: 'select'
+
+- task: VSBuild@1
+  inputs:
+    solution: '$(Build.SourcesDirectory)/Coop/Coop.sln'
+    configuration: 'release'
+    clean: true
+    restoreNugetPackages: true
+
+- task: PowerShell@2
+  inputs:
+    targetType: 'inline'
+    script: |
+      # Write your PowerShell commands here.
+      New-Item -Path '$(Build.ArtifactStagingDirectory)\Release' -ItemType Directory
+      New-Item -Path '$(Build.ArtifactStagingDirectory)\Solutions' -ItemType Directory
+      New-Item -Path '$(Build.ArtifactStagingDirectory)\Settings' -ItemType Directory
+      New-Item -Path '$(Build.ArtifactStagingDirectory)\Package' -ItemType Directory
+      New-Item -Path '$(Build.ArtifactStagingDirectory)\ConfigData' -ItemType Directory
+      New-Item -Path '$(Build.ArtifactStagingDirectory)\Logs' -ItemType Directory
+
+- task: CopyFiles@2
+  inputs:
+    SourceFolder: 'Coop\Coop.Package\bin\Release\net472'
+    Contents: '**'
+    TargetFolder: '$(Build.ArtifactStagingDirectory)\Package'
+
+- task: MSCRMToolInstaller@12
+  inputs:
+    nugetFeed: 'official'
+    psFeed: 'official'
+
+- task: PowerPlatformToolInstaller@2
+  displayName: 'Power Platform Tool Installer '
+  inputs:
+    DefaultVersion: true
+
+- task: PowerShell@2
+  inputs:
+    targetType: 'inline'
+    script: |
+      # Install Module
+      Install-Module -Name Microsoft.Xrm.Tooling.CrmConnector.PowerShell -Force -Scope CurrentUser
+      Install-Module -Name Microsoft.Xrm.Data.PowerShell -AllowClobber  -Force -Scope CurrentUser
+      
+      try
+      {
+      Write-Host "Connecting to Dataverse"
+      $connection = Get-CrmConnection -ConnectionString "AuthType=ClientSecret;ClientId=$(ClientId);ClientSecret=$(ClientSecret);Url=$(Url)"
+      }
+      catch
+      {
+          Write-Host $_.Exception.Message 
+          exit
+      }
+      if($connection.IsReady -ne $True)
+      {
+          $errorDescr = $connection.LastCrmError
+          Write-Host "Connection not established: $errorDescr"
+          exit
+      }
+      else
+      {
+          Write-Host "Connection to $($connection.ConnectedOrgFriendlyName) successful"
+      }
+      
+      # ============ Fetch data ============
+      [string]$fetchXmlStr = "<fetch>
+        <entity name='environmentvariablevalue'>
+          <attribute name='value' />
+          <link-entity name='environmentvariabledefinition' from='environmentvariabledefinitionid' to='environmentvariabledefinitionid'>
+            <filter>
+              <condition attribute='schemaname' operator='eq' value='coop_BuildNumber' />
+            </filter>
+          </link-entity>
+        </entity>
+      </fetch>"
+       
+      $list = New-Object System.Collections.ArrayList
+      
+      $result = Get-CrmRecordsByFetch -conn $connection -Fetch $fetchXmlStr
+
+      $list.AddRange($result.CrmRecords)
+       
+      Write-Host "Fetched $($list.Count)"
+      
+      $i = 0
+      foreach($rec in $list) {
+        $crmId = $rec.environmentvariablevalueid
+        $entity = New-Object Microsoft.Xrm.Sdk.Entity("environmentvariablevalue")
+        $entity.Id = [Guid]::Parse($crmId)
+        $entity.Attributes["value"] = "$(Build.BuildNumber)"
+        $connection.Update($entity)
+        $i = $i+1
+      }
+       
+      Write-Host "Updated $($list.Count)"
+
+- task: PowerShell@2
+  inputs:
+    targetType: 'inline'
+    script: |
+      $toSolutionName = "Release"
+      $BuildId = $(Build.BuildId)
+      
+      Write-Host "Get Build Work Items"
+      
+      
+      # Retrieve Build Work Items
+      $uri = "https://dev.azure.com/coopshared/fnc-cst/_apis/build/builds/$BuildId/workitems?api-version=7.0"
+      
+      Write-Host "BuildId: $BuildId"
+      Write-Host "Uri $uri"
+      Write-Host "$env:SYSTEM_ACCESSTOKEN = $(System.AccessToken)"      
+      $result = Invoke-WebRequest -Uri $uri  -Method GET  -Headers @{ Authorization = "Bearer $(System.AccessToken)" } 
+      $response = $result.Content | ConvertFrom-Json
+      
+      $wiCount = $response | select -ExpandProperty "count"
+      Write-Host "WI Count: $wiCount"
+      
+      if ($wiCount -eq 0) {
+        return "No Work Items Associated to Build. No Solution Components to transport"
+      }
+      
+      # Write-Host "Found $wiCount Work Items. Starting to Copy Solution Components..."
+      
+      $wiList= $response | select -ExpandProperty "value"
+      
+      # Install Module
+      Write-Host "Installing Powershell Modules..."
+      Install-Module -Name Microsoft.Xrm.Tooling.CrmConnector.PowerShell -Force -Scope CurrentUser
+      Install-Module -Name Microsoft.Xrm.Data.PowerShell -AllowClobber  -Force -Scope CurrentUser
+      
+      # Connect to Dataverse
+      try
+      {
+      Write-Host "Connecting to Dataverse"
+      $connection = Get-CrmConnection -ConnectionString "$(Dev.DataverseConnectionString)"
+      }
+      catch
+      {
+          Write-Host $_.Exception.Message 
+          exit
+      }
+      if($connection.IsReady -ne $True)
+      {
+          $errorDescr = $connection.LastCrmError
+          Write-Host "Connection not established: $errorDescr"
+          exit
+      }
+      else
+      {
+          Write-Host "Connection to $($connection.ConnectedOrgFriendlyName) successful"
+      }
+      
+      Write-Host "Target Solution: $toSolutionName"
+      
+      
+      foreach ($workItem in $wiList) {
+      
+      $workitemId = $workitem | select -ExpandProperty "id"
+      Write-Host "Workitem Id: $workitemId"
+      $fromSolutionName = "WI_$workitemId"
+      Write-Host "Retrieving Solution Components for $($fromSolutionName)"
+        
+      # ============ Fetch data ============
+      [string]$fetchXmlStr = $("<fetch>
+        <entity name='solutioncomponent'>
+          <attribute name='rootcomponentbehavior' />
+          <attribute name='objectid' />
+          <attribute name='componenttype' />
+          <link-entity name='solution' from='solutionid' to='solutionid'>
+            <filter>
+              <condition attribute='uniquename' operator='eq' value='{0}' />
+            </filter>
+          </link-entity>
+        </entity>
+      </fetch>" -f $fromSolutionName)
+      
+      Write-Host "FetchXml Query $($fetchXmlStr)"
+             
+      $sourceComponents = New-Object System.Collections.ArrayList
+            
+      $result = Get-CrmRecordsByFetch -conn $connection -Fetch $fetchXmlStr
+      
+      $sourceComponents.AddRange($result.CrmRecords)
+             
+      Write-Host "Fetched $($sourceComponents.Count)"
+      
+      foreach ($component in $sourceComponents) {
+      
+              Write-Host "Fetched $component"
+              $request = [Microsoft.Crm.Sdk.Messages.AddSolutionComponentRequest]::new()
+              $request.ComponentId = [Guid]::Parse($component.objectid)
+              $request.ComponentType = $component.componenttype_Property.Value.Value
+              $request.SolutionUniqueName = $toSolutionName
+              
+              if ($component.componenttype_Property.Value.Value -eq 1) {
+                  Switch ($component.rootcomponentbehavior_Property.Value.Value) {
+                      "1" { 
+                          $request.DoNotIncludeSubcomponents = $true; 
+                          $request.IncludedComponentSettingsValues = $null
+                      }
+                      "2" { 
+                          $request.DoNotIncludeSubcomponents = $true; 
+                          $request.IncludedComponentSettingsValues = @()
+                      }
+                      Default { 
+                          $err = $("Invalid behavior value {0} identified for component {1}" -f $component.rootcomponentbehavior, $component.ObjectId);
+                          Write-Error -Message $err
+                          $err | Out-File -Append 'log\errorlog.txt'
+                      }
+                  }
+              }
+              
+              try {
+                  Write-Verbose ("Adding {0} " -f $request.ComponentId)
+                  $connection.Execute($request) | Out-Null
+              }
+              catch [Microsoft.PowerShell.Commands.WriteErrorException], [System.Management.Automation.MethodInvocationException] {
+                  $err = $_.Exception.Message
+                  if (($err -match 'does not exist') -or
+                      ($err -match 'cannot be added')) {
+                          $err | Out-File -Append 'errorlog.txt'
+                          Write-Host "Error $err"
+                  }
+                  else {
+                      $err | Out-File -Append 'errorlog.txt'
+                      throw $err
+                  }
+              }
+              catch {
+                  $err = $_.Exception.Message
+                  $err | Out-File -Append 'errorlog.txt'
+                  Throw $err
+              }
+          }
+          Write-Host "Copied Solution Components from $fromSolutionName to $toSolutionName"
+      }
+      
+      Write-Host "Finished Copying Solution Components"
+    showWarnings: true
+
+- task: MSCRMSetVersion@12
+  inputs:
+    target: 'crm'
+    crmConnectionString: '$(Dev.DataverseConnectionString)'
+    solutionName: 'Release'
+    versionNumber: '$(Build.BuildNumber)'
+
+- task: MSCRMExportSolution@12
+  inputs:
+    crmConnectionString: '$(Dev.DataverseConnectionString)'
+    solutionName: 'Release'
+    exportManaged: true
+    exportUnmanaged: true
+    outputPath: '$(Build.ArtifactStagingDirectory)\Release'
+
+- task: PowerPlatformChecker@2
+  displayName: 'Power Platform Checker '
+  inputs:
+    PowerPlatformSPN: 'fc-1-dv-gbl-powerplatform-apr-07'
+    FilesToAnalyze: '$(Build.ArtifactStagingDirectory)\Release\**\*.zip'
+    RuleSet: '0ad12346-e108-40b8-a956-9a8f95ea18c9'
+    ErrorThreshold: 0
+
+- task: MSCRMImportSolution@12
+  inputs:
+    crmConnectionString: '$(Build.DataverseConnectionString)'
+    solutionFile: '$(Build.ArtifactStagingDirectory)\Release\Release.zip'
+    logsDirectory: '$(Build.ArtifactStagingDirectory)'
+
+- task: PowerPlatformPublishCustomizations@2
+  displayName: 'Power Platform Publish Customizations '
+  inputs:
+    authenticationType: PowerPlatformSPN
+    PowerPlatformSPN: 'fc-1-dv-gbl-powerplatform-apr-07'
+
+- task: MSCRMCopySolutionComponents@12
+  inputs:
+    crmConnectionString: '$(Build.DataverseConnectionString)'
+    fromSolutionName: 'Release'
+    toSolutionName: 'CoopFuneralcare'
+
+- task: MSCRMSetVersion@12
+  inputs:
+    target: 'crm'
+    crmConnectionString: '$(Build.DataverseConnectionString)'
+    solutionName: 'CoopFuneralcare'
+    versionNumber: '$(Build.BuildNumber)'
+
+- task: MSCRMExportSolution@12
+  inputs:
+    crmConnectionString: '$(Build.DataverseConnectionString)'
+    solutionName: 'CoopFuneralcare'
+    exportManaged: true
+    exportUnmanaged: true
+    outputPath: '$(Build.ArtifactStagingDirectory)\Solutions'
+    crmConnectionTimeout: '1200'
+    asyncWaitTimeout: '9000'
+
+- task: MSCRMExportSolution@12
+  inputs:
+    crmConnectionString: '$(Dev.DataverseConnectionString)'
+    solutionName: 'Ribbon'
+    exportManaged: true
+    exportUnmanaged: true
+    outputPath: '$(Build.ArtifactStagingDirectory)\Solutions'
+    crmConnectionTimeout: '1200'
+    asyncWaitTimeout: '9000'
+
+- task: PowerPlatformUnpackSolution@2
+  inputs:
+    SolutionInputFile: '$(Build.ArtifactStagingDirectory)\solutions\CoopFuneralcare.zip'
+    SolutionTargetFolder: '$(Build.SourcesDirectory)\solutions\CoopFuneralcare'
+    SolutionType: 'Both'
+    OverwriteFiles: true
+
+# - task: MSCRMExportCMData@12
+#   inputs:
+#     crmConnectionString: '$(Dev.DataverseConnectionString)'
+#     schemaFile: '$(Build.SourcesDirectory)\Coop\Coop.ConfigurationData\Schema\data_schema.xml'
+#     dataFile: '$(Build.ArtifactStagingDirectory)\ConfigData'
+#     logsDirectory: '$(Build.ArtifactStagingDirectory)\Logs'
+
+- task: CopyFiles@2
+  inputs:
+    SourceFolder: '$(Build.SourcesDirectory)\pipelines'
+    Contents: 'deployment-settings.json'
+    TargetFolder: '$(Build.ArtifactStagingDirectory)\Settings'
+
+- task: CopyFiles@2
+  inputs:
+    SourceFolder: '$(Build.SourcesDirectory)\pipelines'
+    Contents: 'share-app.ps1'
+    TargetFolder: '$(Build.ArtifactStagingDirectory)\Settings'
+
+- script: |
+   git config --global user.email "build@coop.co.uk"
+   git config --global user.name "Build Service"
+
+   git init
+    
+   git add .
+   
+   git commit -m "[skip ci] $(Build.BuildNumber)"
+   
+   git push origin HEAD:main
+   
+  displayName: 'Commit to Repo'
+
+- task: MSCRMRemoveSolutionComponents@12
+  inputs:
+    crmConnectionString: '$(Dev.DataverseConnectionString)'
+    solutionName: 'Release'
+
+- task: PublishBuildArtifacts@1
+  inputs:
+    PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+    ArtifactName: 'CoopFuneralcare'
+    publishLocation: 'Container'
